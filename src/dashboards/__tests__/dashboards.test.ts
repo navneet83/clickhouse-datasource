@@ -164,6 +164,57 @@ describe('OTel dashboards', () => {
     });
   });
 
+  describe('query-analysis query_log source', () => {
+    const QUERY_ANALYSIS = 'query-analysis.json';
+    const readDashboard = () =>
+      JSON.parse(fs.readFileSync(path.join(DASHBOARDS_DIR, QUERY_ANALYSIS), 'utf8')) as {
+        templating?: { list?: Array<{ name?: string; type?: string; query?: unknown }> };
+      };
+
+    it('exposes query_log as a constant variable defaulting to the local system table', () => {
+      const variable = readDashboard().templating?.list?.find((v) => v.name === 'query_log');
+      expect(variable).toBeDefined();
+      expect(variable?.type).toBe('constant');
+      expect(variable?.query).toBe('system.query_log');
+    });
+
+    it('reads every panel and variable through ${query_log}', () => {
+      // A single hard-coded system.query_log would silently pin that panel to the local node
+      // while the rest of the dashboard followed the selected source.
+      const content = fs.readFileSync(path.join(DASHBOARDS_DIR, QUERY_ANALYSIS), 'utf8');
+      const sources = content.match(/(?:FROM|JOIN)\s+(?:\$\{query_log\}|[\w.]*query_log)/g) ?? [];
+      expect(sources.length).toBeGreaterThan(0);
+      for (const source of sources) {
+        expect(source.replace(/(?:FROM|JOIN)\s+/, '')).toBe('${query_log}');
+      }
+    });
+
+    it('filters every panel by the dashboard variables', () => {
+      // Two panels used to read the whole query_log regardless of the Query status, user and
+      // query kind selections, which reads as a rendering bug rather than a filter.
+      const dashboard = JSON.parse(fs.readFileSync(path.join(DASHBOARDS_DIR, QUERY_ANALYSIS), 'utf8')) as {
+        panels?: Array<{ title?: string; targets?: Array<{ rawSql?: string }>; panels?: unknown }>;
+      };
+      const flatten = (panels: typeof dashboard.panels = []): NonNullable<typeof dashboard.panels> =>
+        panels.flatMap((panel) => [panel, ...flatten((panel.panels as typeof dashboard.panels) ?? [])]);
+
+      const queries = flatten(dashboard.panels).flatMap((panel) =>
+        (panel.targets ?? []).map((target) => ({ title: panel.title ?? '', sql: target.rawSql ?? '' }))
+      );
+      expect(queries.length).toBeGreaterThan(0);
+
+      for (const { title, sql } of queries.filter(({ sql }) => sql.includes('${query_log}'))) {
+        for (const column of ['type', 'initial_user', 'query_kind']) {
+          // Either the variable drives the column, or the panel constrains that column itself
+          // — "Query requests by user" picks its own top ten, as it does on main.
+          const constrained =
+            sql.includes(`$__conditionalAll(${column} IN (`) || new RegExp(`\\b${column} (?:IN|!=|=) `).test(sql);
+          expect(`${title} constrains ${column}`).toBe(constrained ? `${title} constrains ${column}` : sql);
+        }
+      }
+    });
+  });
+
   describe('template variable quoting', () => {
     // allDashboards covers every bundled dashboard, so a bare interpolation added to any of
     // them is caught.
@@ -245,6 +296,55 @@ describe('OTel dashboards', () => {
       // ...and qualification must actually have happened: at least one table
       // reference is prefixed with the ${database} variable.
       expect(content).toMatch(/(?:FROM|JOIN)\s+\$\{database\}\.otel_(?:logs|traces)\b/);
+    });
+  });
+
+  describe('interval variable', () => {
+    type Panel = { gridPos?: unknown; interval?: string; targets?: Array<{ rawSql?: string }> };
+    type Dashboard = {
+      templating?: { list?: Array<{ name?: string; type?: string }> };
+      panels?: Array<Panel & { panels?: Panel[] }>;
+    };
+
+    const flatten = (d: Dashboard): Panel[] => (d.panels ?? []).flatMap((p) => [p, ...(p.panels ?? [])]);
+
+    it.each(otelDashboards)('%s exposes an "interval" interval variable', (filename) => {
+      const d = JSON.parse(fs.readFileSync(path.join(DASHBOARDS_DIR, filename), 'utf8')) as Dashboard;
+      const variable = d.templating?.list?.find((v) => v.name === 'interval');
+      expect(variable).toBeDefined();
+      expect(variable?.type).toBe('interval');
+    });
+
+    it.each(otelDashboards)('%s sets min interval on every $__interval_s panel', (filename) => {
+      const d = JSON.parse(fs.readFileSync(path.join(DASHBOARDS_DIR, filename), 'utf8')) as Dashboard;
+      const bucketed = flatten(d).filter((p) =>
+        (p.targets ?? []).some((t) => (t.rawSql ?? '').includes('$__interval_s'))
+      );
+      expect(bucketed.length).toBeGreaterThan(0);
+      for (const panel of bucketed) {
+        expect(panel.interval).toBe('${interval}');
+      }
+    });
+
+    const intervalLinksIn = (filename: string) =>
+      fs.readFileSync(path.join(DASHBOARDS_DIR, filename), 'utf8').match(/var-interval=\$\{interval[^}]*\}/g) ?? [];
+
+    it.each(otelDashboards)('%s forwards the interval through drill-through links', (filename) => {
+      // Plain ${interval}, not :text. On scenes, IntervalVariable defines no getValueText, so
+      // the :text formatter falls through to getValue() and forwards the resolved bucket
+      // anyway; and the target's updateFromUrl takes any non-sentinel string verbatim, so
+      // var-interval=auto would set a literal "auto" that is not one of its options. A
+      // drill-through therefore pins the bucket that was in effect, which is at least a value
+      // the target can honour. The dashboard-level menu link keeps auto via includeVars.
+      for (const param of intervalLinksIn(filename)) {
+        expect(param).toBe('var-interval=${interval}');
+      }
+    });
+
+    it('otel-service-dashboard.json has interval-forwarding links for that guard to check', () => {
+      // The loop above runs zero times for the two explorers, so without this the guard would
+      // still pass if the parameter were dropped from every link.
+      expect(intervalLinksIn('otel-service-dashboard.json').length).toBeGreaterThan(0);
     });
   });
 });
